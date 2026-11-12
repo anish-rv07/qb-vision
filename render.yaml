@@ -1,0 +1,13 @@
+# Render Blueprint: lets Render create the web service from this repo automatically.
+services:
+  - type: web
+    name: qb-vision
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.5"
+      - key: GEMINI_API_KEY
+        sync: false   # Render asks you for the value; it is never stored in the repo.
