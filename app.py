@@ -12,10 +12,12 @@ import html
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
 import gradio as gr
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
@@ -61,6 +63,11 @@ MAX_OUTPUT_TOKENS = 65536     # The response is long; Pro models also "think" in
 FILE_ACTIVE_TIMEOUT = 300     # Seconds to wait for the uploaded video to finish processing.
 REQUEST_TIMEOUT = 150         # Seconds before one Gemini request counts as stuck (normal runs take ~60).
 TOTAL_TIME_BUDGET = 420       # Stop trying more models after this many seconds in total.
+
+# Spoken coaching (optional). Without ELEVENLABS_API_KEY the app works the same, just silent.
+ELEVENLABS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # "George"
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 # Known models, best first. The model list API can be out of date (it may list
 # retired models and omit new previews), so we also try these and skip any that 404.
 # Pro is tried first; Flash is the fallback when Pro is unavailable (e.g. free tier).
@@ -503,6 +510,92 @@ def render_couldnt_see(data):
 
 
 # ---------------------------------------------------------------------------
+# Spoken coaching with ElevenLabs
+# ---------------------------------------------------------------------------
+
+def spoken_grade(grade):
+    """'B+' -> 'B plus', so the voice reads it naturally."""
+    grade = text(grade, "").strip()
+    return grade.replace("+", " plus").replace("-", " minus") if grade else ""
+
+
+def coaching_script(data):
+    """
+    A short, friendly message for the voice to read (about 15-25 seconds).
+    Built from the analysis so it always matches what's on screen.
+    """
+    summary = data.get("summary") or {}
+    eyes = data.get("qb_eyes") or {}
+    throw = data.get("throw") or {}
+    eyes = eyes if isinstance(eyes, dict) else {}
+    throw = throw if isinstance(throw, dict) else {}
+
+    lines = []
+    grade = spoken_grade(summary.get("decision_grade"))
+    if grade:
+        lines.append(f"Your grade on this play: {grade}.")
+    if not is_none(summary.get("coaching_tip")):
+        lines.append(text(summary.get("coaching_tip")))
+    if not is_none(eyes.get("stared_down_target")):
+        lines.append("Watch your eyes. You locked onto one receiver, and the defense can read that.")
+    if not is_none(throw.get("better_option")):
+        lines.append(f"Better choice: {text(throw.get('better_option'))}")
+    else:
+        lines.append("You picked the right receiver. Keep it up.")
+    return " ".join(line.strip() for line in lines)
+
+
+def speak(script):
+    """
+    Turn the script into an MP3 with ElevenLabs. Returns (file path or None, note).
+    Voice problems never break the analysis; they just show a short note.
+    """
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        return None, ""  # Voice is optional: stay quiet when no key is set.
+    if not script:
+        return None, ""
+    try:
+        response = httpx.post(
+            ELEVENLABS_URL.format(voice_id=ELEVENLABS_VOICE_ID),
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={"text": script, "model_id": ELEVENLABS_MODEL},
+            timeout=60,
+        )
+    except httpx.HTTPError as e:
+        print(f"[QB Vision] ElevenLabs request failed: {e!r}")
+        return None, "Couldn't reach the voice service. The written report is above."
+    if response.status_code != 200:
+        print(f"[QB Vision] ElevenLabs error {response.status_code}: {response.text[:300]}")
+        if response.status_code in (401, 403):
+            return None, "The ElevenLabs key was rejected. Check ELEVENLABS_API_KEY."
+        if response.status_code == 429:
+            return None, "The voice service is busy or out of credits. Try again later."
+        return None, "The voice service had a problem. The written report is above."
+
+    # Save the audio to a temp file that Gradio can play.
+    with tempfile.NamedTemporaryFile(prefix="qb_voice_", suffix=".mp3", delete=False) as f:
+        f.write(response.content)
+        return f.name, ""
+
+
+def voice_coach(raw_json):
+    """
+    Runs right after the analysis (so the report shows first, then the voice).
+    Reads the analysis from the raw JSON box; does nothing if the analysis failed.
+    """
+    try:
+        data = json.loads(raw_json) if raw_json else None
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict) or "summary" not in data:
+        return None, ""
+    path, note = speak(coaching_script(data))
+    return path, (f"_{note}_" if note else "")
+
+
+# ---------------------------------------------------------------------------
 # Main Gradio handler
 # ---------------------------------------------------------------------------
 
@@ -739,6 +832,13 @@ with gr.Blocks(title="QB Vision") as demo:
         with gr.Column(scale=2):
             status_out = gr.Markdown("Upload a clip and click **Analyze play**.", elem_classes="qb-status")
             summary_out = gr.HTML()
+            voice_out = gr.Audio(
+                label="Coach's voice", type="filepath", autoplay=True, interactive=False,
+                visible=bool(os.environ.get("ELEVENLABS_API_KEY")),  # Hidden without a key.
+                waveform_options=gr.WaveformOptions(waveform_color="#22314d",
+                                                    waveform_progress_color="#22c55e"),
+            )
+            voice_note = gr.Markdown(elem_classes="qb-status")
 
             section("Your receivers")
             receivers_out = gr.HTML()
@@ -769,6 +869,11 @@ with gr.Blocks(title="QB Vision") as demo:
         inputs=[video_in, play_info_in],
         outputs=[status_out, summary_out, receivers_out, defenders_out, eyes_out,
                  throw_out, timeline_out, couldnt_see_out, raw_out],
+    ).then(
+        # After the report is on screen, generate the spoken coaching.
+        voice_coach,
+        inputs=[raw_out],
+        outputs=[voice_out, voice_note],
     )
 
     # Hidden, never-clicked button that satisfies ZeroGPU's startup check (see top of file).

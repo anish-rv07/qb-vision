@@ -34,6 +34,12 @@ python app.py
 
 Free Render apps sleep after ~15 minutes idle; the next visit takes about a minute to wake.
 
+### Spoken coaching (optional)
+
+After each analysis, ElevenLabs reads a short coaching message (grade, tip, and the
+better choice). Add `ELEVENLABS_API_KEY` in the Render service's **Environment** tab to turn
+it on. Optional: `ELEVENLABS_VOICE_ID` picks a different voice (default: "George").
+
 ## Deploy to Hugging Face Spaces
 
 1. Create a new Space with the **Gradio** SDK on **ZeroGPU** hardware (the free option

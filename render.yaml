@@ -11,3 +11,5 @@ services:
         value: "3.13.5"
       - key: GEMINI_API_KEY
         sync: false   # Render asks you for the value; it is never stored in the repo.
+      - key: ELEVENLABS_API_KEY
+        sync: false   # Optional: turns on spoken coaching.
