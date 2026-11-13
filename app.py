@@ -16,10 +16,20 @@ import time
 from pathlib import Path
 
 import gradio as gr
-import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
+
+# Network errors from the Gemini SDK. Newer SDK versions use the `httpx2` package,
+# older ones use `httpx`, so we catch whichever is installed.
+_http_modules = []
+for _name in ("httpx2", "httpx"):
+    try:
+        _http_modules.append(__import__(_name))
+    except ImportError:
+        pass
+TIMEOUT_ERRORS = tuple(m.TimeoutException for m in _http_modules)
+NETWORK_ERRORS = tuple(m.TransportError for m in _http_modules) + (ConnectionError,)
 
 # Free Hugging Face accounts host Gradio apps on "ZeroGPU" hardware, which refuses
 # to start unless a Gradio event is wired to a function marked @spaces.GPU. This app
@@ -49,6 +59,8 @@ EXAMPLES_DIR = APP_DIR / "examples"
 VIDEO_FPS = 4                 # Frames per second Gemini samples (catches route breaks).
 MAX_OUTPUT_TOKENS = 65536     # The response is long; Pro models also "think" inside this budget.
 FILE_ACTIVE_TIMEOUT = 300     # Seconds to wait for the uploaded video to finish processing.
+REQUEST_TIMEOUT = 150         # Seconds before one Gemini request counts as stuck (normal runs take ~60).
+TOTAL_TIME_BUDGET = 420       # Stop trying more models after this many seconds in total.
 # Known models, best first. The model list API can be out of date (it may list
 # retired models and omit new previews), so we also try these and skip any that 404.
 # Pro is tried first; Flash is the fallback when Pro is unavailable (e.g. free tier).
@@ -86,20 +98,21 @@ def get_client():
                 "or as a Secret in your Hugging Face Space settings."
             )
         # v1beta is required for preview models such as gemini-3.1-pro-preview.
-        _client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
+        _client = genai.Client(
+            api_key=api_key,
+            http_options={"api_version": "v1beta", "timeout": REQUEST_TIMEOUT * 1000},
+        )
     return _client
 
 
 def candidate_models(client):
     """
-    Return models to try, best first: newest Pro models, then newest Flash models.
-    Set GEMINI_MODEL to force one.
+    Return models to try, best first: Pro, then Flash, then Flash-Lite (newest first in each).
+    The model that worked last time is tried first. Set GEMINI_MODEL to force one.
     """
     override = os.environ.get("GEMINI_MODEL")
     if override:
         return [override]
-    if _working_model:
-        return [_working_model]
 
     names = set(KNOWN_MODELS)
     try:
@@ -112,16 +125,21 @@ def candidate_models(client):
 
     ranked = []
     for name in names:
-        # Only plain "gemini-X.Y-pro" / "gemini-X.Y-flash" text models.
-        match = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-(pro|flash)(-preview)?(-[\w-]+)?", name)
+        # Only plain "gemini-X.Y-pro" / "-flash" / "-flash-lite" text models.
+        match = re.fullmatch(r"gemini-(\d+(?:\.\d+)?)-(pro|flash)(-lite)?(-preview)?(-[\w-]+)?", name)
         if not match or any(bad in name for bad in
-                            ("lite", "tts", "image", "audio", "computer", "embedding", "customtools")):
+                            ("tts", "image", "audio", "computer", "embedding", "customtools")):
             continue
-        tier = 1 if match.group(2) == "pro" else 0  # Pro before Flash.
+        # Pro first; Flash next; Flash-Lite (faster, less accurate) as the last resort.
+        tier = 2 if match.group(2) == "pro" else (0 if match.group(3) else 1)
         version = float(match.group(1))
-        is_plain = match.group(4) is None  # "-preview" yes, "-preview-customtools" no
+        is_plain = match.group(5) is None  # "-preview" yes, "-preview-customtools" no
         ranked.append(((tier, version, is_plain, -len(name)), name))
-    return [name for _, name in sorted(ranked, reverse=True)]
+    models = [name for _, name in sorted(ranked, reverse=True)]
+    if _working_model in models:
+        models.remove(_working_model)
+        models.insert(0, _working_model)
+    return models
 
 
 def load_prompt(play_info):
@@ -217,8 +235,12 @@ def parse_json(text):
     raise FriendlyError("Gemini's response wasn't valid JSON. Please try again; the raw text is below.")
 
 
+class ModelStuck(Exception):
+    """A model timed out or kept dropping the connection; try the next one."""
+
+
 def generate_with_retry(client, model, parts):
-    """Ask Gemini for the analysis. Retries once if the network connection drops."""
+    """Ask Gemini for the analysis. Retries once if the connection drops; gives up on timeouts."""
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -228,10 +250,13 @@ def generate_with_retry(client, model, parts):
             return client.models.generate_content(
                 model=model, contents=[types.Content(role="user", parts=parts)], config=config
             )
-        except (httpx.TransportError, ConnectionError) as e:
+        except TIMEOUT_ERRORS:
+            # Stuck for REQUEST_TIMEOUT seconds: don't wait again on the same model.
+            raise ModelStuck(f"{model} timed out")
+        except NETWORK_ERRORS as e:
             # Long video requests can get cut off by flaky networks; try once more.
             print(f"[QB Vision] Connection problem with {model} ({e!r}), attempt {attempt + 1}.")
-    raise FriendlyError("Lost the connection to Gemini during the analysis. Please try again.")
+    raise ModelStuck(f"{model} kept dropping the connection")
 
 
 def analyze_with_gemini(video_path, play_info):
@@ -249,28 +274,46 @@ def analyze_with_gemini(video_path, play_info):
             video_metadata=types.VideoMetadata(fps=VIDEO_FPS),
         )
         response, model, last_error, busy_skipped = None, None, None, False
-        for candidate in candidate_models(client):
-            try:
-                response = generate_with_retry(client, candidate, [video_part, types.Part(text=prompt)])
-                model = candidate
-                break
-            except errors.APIError as e:
-                last_error = e
-                # Move on to the next model if this one is retired (404), has no quota
-                # on this key (429 "limit: 0", e.g. Pro on the free tier), or is overloaded (503).
-                no_quota = e.code == 429 and "limit: 0" in str(e)
-                if e.code in (404, 503) or no_quota:
-                    print(f"[QB Vision] {candidate} unavailable ({e.code}), trying next model.")
-                    busy_skipped = busy_skipped or e.code == 503
+        started = time.time()
+        candidates = candidate_models(client)
+        for round_number in range(2):  # A second round only if every model was busy.
+            for candidate in candidates:
+                if time.time() - started > TOTAL_TIME_BUDGET:
+                    break  # Don't keep the user waiting forever.
+                try:
+                    response = generate_with_retry(client, candidate, [video_part, types.Part(text=prompt)])
+                    model = candidate
+                    break
+                except errors.APIError as e:
+                    last_error = e
+                    # Move on to the next model if this one is retired (404), has no quota on
+                    # this key (429 "limit: 0", e.g. Pro on the free tier), or is overloaded (5xx).
+                    no_quota = e.code == 429 and "limit: 0" in str(e)
+                    busy = e.code is not None and e.code >= 500
+                    if e.code == 404 or no_quota or busy:
+                        print(f"[QB Vision] {candidate} unavailable ({e.code}), trying next model.")
+                        busy_skipped = busy_skipped or busy
+                        continue
+                    raise FriendlyError(describe_api_error(e, "analyzing the play"))
+                except ModelStuck as e:
+                    print(f"[QB Vision] {e}, trying next model.")
+                    busy_skipped = True
+                    last_error = None
                     continue
-                raise FriendlyError(describe_api_error(e, "analyzing the play"))
+            if time.time() - started > TOTAL_TIME_BUDGET:
+                break
+            if response is not None or not busy_skipped or round_number == 1:
+                break
+            print("[QB Vision] Every model was busy; waiting 10s and trying again.")
+            time.sleep(10)
+
         if response is None:
-            if last_error is not None and last_error.code == 503:
-                raise FriendlyError(describe_api_error(last_error, "analyzing the play"))
+            if busy_skipped:
+                raise FriendlyError("Gemini's servers are overloaded right now. "
+                                    "Please wait a minute and click Analyze play again.")
             raise FriendlyError("None of the Gemini models are available to this API key. "
                                 "Set GEMINI_MODEL to a model you can use.")
-        if not busy_skipped:  # Don't stick with a fallback picked only because Pro was busy.
-            _working_model = model
+        _working_model = model
         print(f"[QB Vision] Using model: {model}")
 
         raw = response.text or ""
