@@ -12,6 +12,7 @@ import html
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import wave
@@ -55,6 +56,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 load_dotenv()  # Reads .env locally. On Hugging Face Spaces, use a Secret instead.
+
+# Hosting logs (Render, Spaces) only show print() output promptly if it isn't buffered.
+sys.stdout.reconfigure(line_buffering=True)
 
 APP_DIR = Path(__file__).parent
 PROMPT_PATH = APP_DIR / "analysis_prompt.txt"
@@ -562,6 +566,17 @@ class VoiceError(Exception):
     """A short, user-facing message about the voice service."""
 
 
+def elevenlabs_reason(response):
+    """ElevenLabs' short error reason, e.g. 'payment_required', for messages and logs."""
+    try:
+        detail = response.json().get("detail")
+        if isinstance(detail, dict):
+            return text(detail.get("status") or detail.get("message"))[:120]
+        return text(detail)[:120]
+    except Exception:
+        return response.text[:120] or "no details"
+
+
 def tts_pcm(api_key, voice_id, line):
     """One line of speech from ElevenLabs as raw 16-bit audio."""
     try:
@@ -576,15 +591,18 @@ def tts_pcm(api_key, voice_id, line):
         print(f"[QB Vision] ElevenLabs request failed: {e!r}")
         raise VoiceError("Couldn't reach the voice service. The transcript is below.")
     if response.status_code != 200:
-        print(f"[QB Vision] ElevenLabs error {response.status_code}: {response.text[:300]}")
-        if response.status_code == 401 and "voice" not in response.text.lower():
-            raise VoiceError("The ElevenLabs key was rejected. Check ELEVENLABS_API_KEY.")
+        print(f"[QB Vision] ElevenLabs error {response.status_code}: {response.text[:500]}")
+        reason = elevenlabs_reason(response)
+        if response.status_code == 401 and "voice" not in reason.lower():
+            raise VoiceError(f"The ElevenLabs key was rejected ({reason}). Check ELEVENLABS_API_KEY.")
         if response.status_code == 429:
             raise VoiceError("The voice service is busy or out of credits. The transcript is below.")
-        if "voice" in response.text.lower():
-            raise VoiceError("That ElevenLabs voice isn't available. Set ELEVENLABS_PLAY_BY_PLAY_VOICE "
-                             "and ELEVENLABS_ANALYST_VOICE to voices from your account.")
-        raise VoiceError("The voice service had a problem. The transcript is below.")
+        if "voice" in reason.lower():
+            raise VoiceError(f"That ElevenLabs voice isn't available ({reason}). Set "
+                             "ELEVENLABS_PLAY_BY_PLAY_VOICE and ELEVENLABS_ANALYST_VOICE "
+                             "to voices from your account.")
+        raise VoiceError(f"The voice service had a problem (error {response.status_code}: {reason}). "
+                         "The transcript is below.")
     return response.content
 
 
@@ -632,7 +650,7 @@ def broadcast_booth(raw_json):
         return None, transcript, f"_{e}_"
     except Exception as e:  # Never let the voice break the page.
         print(f"[QB Vision] Broadcast booth failed: {e!r}")
-        return None, transcript, "_The voice service had a problem. The transcript is below._"
+        return None, transcript, f"_The voice service had a problem ({type(e).__name__}). The transcript is below._"
 
 
 # ---------------------------------------------------------------------------
