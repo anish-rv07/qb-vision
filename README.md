@@ -34,11 +34,13 @@ python app.py
 
 Free Render apps sleep after ~15 minutes idle; the next visit takes about a minute to wake.
 
-### Spoken coaching (optional)
+### Broadcast booth replay (optional)
 
-After each analysis, ElevenLabs reads a short coaching message (grade, tip, and the
-better choice). Add `ELEVENLABS_API_KEY` in the Render service's **Environment** tab to turn
-it on. Optional: `ELEVENLABS_VOICE_ID` picks a different voice (default: "George").
+After each analysis, two announcers call the play like a TV replay: a play-by-play voice
+calls the action and an analyst breaks down the read. Gemini writes the call while it
+watches the clip; ElevenLabs voices it. The transcript always shows; add
+`ELEVENLABS_API_KEY` in the Render service's **Environment** tab to hear it.
+Optional: `ELEVENLABS_PLAY_BY_PLAY_VOICE` and `ELEVENLABS_ANALYST_VOICE` pick other voices.
 
 ## Deploy to Hugging Face Spaces
 

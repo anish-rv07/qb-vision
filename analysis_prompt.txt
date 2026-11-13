@@ -21,6 +21,13 @@ Rules:
   - Avoid coach jargon (like "X receiver", "leverage", "MOFC", "boundary"). If a football
     term helps, explain it in a few plain words, e.g. "zone (each defender guards an area)".
   - Describe places simply: "left side", "middle of the field", "about 10 yards deep".
+- "broadcast" is a TV-replay call of this play by two announcers, 5 to 8 short lines in order:
+  - "play_by_play" calls the action with energy as it happens (snap, rush, throw, result).
+  - "analyst" explains the key read in plain words: what the quarterback saw, any
+    stare-down, and the better choice.
+  - Each line under 25 words. Refer to players by what they look like ("the receiver in
+    yellow"), never by IDs like R1 or D2. Talk about the quarterback as "the QB" or "he".
+  - No made-up names, teams, scores, or anything you did not see.
 - "decision_grade" is a letter grade from A to F for the QB's decision (not the outcome).
 - "confidence" is "high", "medium", or "low", based on how well you could see the play.
 
@@ -72,5 +79,9 @@ Respond with ONLY valid JSON, no markdown, matching this structure:
   ],
   "couldnt_see": [
     "Anything the camera missed, in plain words"
+  ],
+  "broadcast": [
+    { "speaker": "play_by_play", "line": "Here's the snap, and the QB is looking left right away." },
+    { "speaker": "analyst", "line": "Watch his eyes here. He's locked on the receiver in yellow the whole way." }
   ]
 }

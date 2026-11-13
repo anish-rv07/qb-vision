@@ -14,6 +14,8 @@ import os
 import re
 import tempfile
 import time
+import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import gradio as gr
@@ -64,9 +66,13 @@ FILE_ACTIVE_TIMEOUT = 300     # Seconds to wait for the uploaded video to finish
 REQUEST_TIMEOUT = 150         # Seconds before one Gemini request counts as stuck (normal runs take ~60).
 TOTAL_TIME_BUDGET = 420       # Stop trying more models after this many seconds in total.
 
-# Spoken coaching (optional). Without ELEVENLABS_API_KEY the app works the same, just silent.
+# Broadcast booth (optional). Without ELEVENLABS_API_KEY the app works the same, just silent.
 ELEVENLABS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # "George"
+ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
+# Two stock ElevenLabs voices; override with your own voice IDs if you like.
+PLAY_BY_PLAY_VOICE = os.environ.get("ELEVENLABS_PLAY_BY_PLAY_VOICE", "nPczCjzI2devNBz1zQrb")  # "Brian"
+ANALYST_VOICE = os.environ.get("ELEVENLABS_ANALYST_VOICE", "JBFqnCBsd6RMkjVDRZzb")  # "George"
+SAMPLE_RATE = 24000  # Raw audio from ElevenLabs (pcm_24000), so lines can be joined cleanly.
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 # Known models, best first. The model list API can be out of date (it may list
 # retired models and omit new previews), so we also try these and skip any that 404.
@@ -510,89 +516,123 @@ def render_couldnt_see(data):
 
 
 # ---------------------------------------------------------------------------
-# Spoken coaching with ElevenLabs
+# Broadcast booth: two ElevenLabs voices call the play like a TV replay
 # ---------------------------------------------------------------------------
 
-def spoken_grade(grade):
-    """'B+' -> 'B plus', so the voice reads it naturally."""
-    grade = text(grade, "").strip()
-    return grade.replace("+", " plus").replace("-", " minus") if grade else ""
+SPEAKER_NAMES = {"play_by_play": "Play-by-play", "analyst": "Analyst"}
 
 
-def coaching_script(data):
+def booth_script(data):
     """
-    A short, friendly message for the voice to read (about 15-25 seconds).
-    Built from the analysis so it always matches what's on screen.
+    The announcers' lines as [(speaker, line), ...]. Gemini writes these while it
+    watches the clip; if it didn't, we build a simple call from the analysis.
     """
-    summary = data.get("summary") or {}
-    eyes = data.get("qb_eyes") or {}
-    throw = data.get("throw") or {}
-    eyes = eyes if isinstance(eyes, dict) else {}
-    throw = throw if isinstance(throw, dict) else {}
-
     lines = []
-    grade = spoken_grade(summary.get("decision_grade"))
-    if grade:
-        lines.append(f"Your grade on this play: {grade}.")
+    for item in as_list(data.get("broadcast")):
+        if isinstance(item, dict) and not is_none(item.get("line")):
+            speaker = "analyst" if "analyst" in text(item.get("speaker")).lower() else "play_by_play"
+            lines.append((speaker, text(item.get("line")).strip()))
+    if lines:
+        return lines[:8]
+
+    # Backup script from the analysis itself.
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    throw = data.get("throw") if isinstance(data.get("throw"), dict) else {}
+    for item in as_list(data.get("timeline"))[:4]:
+        event = item.get("event") if isinstance(item, dict) else item
+        if not is_none(event):
+            lines.append(("play_by_play", text(event).rstrip(".") + "."))
     if not is_none(summary.get("coaching_tip")):
-        lines.append(text(summary.get("coaching_tip")))
-    if not is_none(eyes.get("stared_down_target")):
-        lines.append("Watch your eyes. You locked onto one receiver, and the defense can read that.")
+        lines.append(("analyst", text(summary.get("coaching_tip"))))
     if not is_none(throw.get("better_option")):
-        lines.append(f"Better choice: {text(throw.get('better_option'))}")
-    else:
-        lines.append("You picked the right receiver. Keep it up.")
-    return " ".join(line.strip() for line in lines)
+        lines.append(("analyst", "The better choice? " + text(throw.get("better_option"))))
+    return lines
 
 
-def speak(script):
-    """
-    Turn the script into an MP3 with ElevenLabs. Returns (file path or None, note).
-    Voice problems never break the analysis; they just show a short note.
-    """
-    api_key = os.environ.get("ELEVENLABS_API_KEY")
-    if not api_key:
-        return None, ""  # Voice is optional: stay quiet when no key is set.
-    if not script:
-        return None, ""
+def render_booth_transcript(lines):
+    """The script on screen, so the booth works with the sound off too."""
+    rows = "".join(
+        f'<div class="qb-line qb-{speaker}"><span>{SPEAKER_NAMES[speaker]}</span>{html.escape(line)}</div>'
+        for speaker, line in lines
+    )
+    return f'<div class="qb-booth">{rows}</div>' if rows else ""
+
+
+class VoiceError(Exception):
+    """A short, user-facing message about the voice service."""
+
+
+def tts_pcm(api_key, voice_id, line):
+    """One line of speech from ElevenLabs as raw 16-bit audio."""
     try:
         response = httpx.post(
-            ELEVENLABS_URL.format(voice_id=ELEVENLABS_VOICE_ID),
-            params={"output_format": "mp3_44100_128"},
+            ELEVENLABS_URL.format(voice_id=voice_id),
+            params={"output_format": f"pcm_{SAMPLE_RATE}"},
             headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-            json={"text": script, "model_id": ELEVENLABS_MODEL},
+            json={"text": line, "model_id": ELEVENLABS_MODEL},
             timeout=60,
         )
     except httpx.HTTPError as e:
         print(f"[QB Vision] ElevenLabs request failed: {e!r}")
-        return None, "Couldn't reach the voice service. The written report is above."
+        raise VoiceError("Couldn't reach the voice service. The transcript is below.")
     if response.status_code != 200:
         print(f"[QB Vision] ElevenLabs error {response.status_code}: {response.text[:300]}")
-        if response.status_code in (401, 403):
-            return None, "The ElevenLabs key was rejected. Check ELEVENLABS_API_KEY."
+        if response.status_code == 401 and "voice" not in response.text.lower():
+            raise VoiceError("The ElevenLabs key was rejected. Check ELEVENLABS_API_KEY.")
         if response.status_code == 429:
-            return None, "The voice service is busy or out of credits. Try again later."
-        return None, "The voice service had a problem. The written report is above."
+            raise VoiceError("The voice service is busy or out of credits. The transcript is below.")
+        if "voice" in response.text.lower():
+            raise VoiceError("That ElevenLabs voice isn't available. Set ELEVENLABS_PLAY_BY_PLAY_VOICE "
+                             "and ELEVENLABS_ANALYST_VOICE to voices from your account.")
+        raise VoiceError("The voice service had a problem. The transcript is below.")
+    return response.content
 
-    # Save the audio to a temp file that Gradio can play.
-    with tempfile.NamedTemporaryFile(prefix="qb_voice_", suffix=".mp3", delete=False) as f:
-        f.write(response.content)
-        return f.name, ""
 
-
-def voice_coach(raw_json):
+def booth_audio(lines):
     """
-    Runs right after the analysis (so the report shows first, then the voice).
+    Voice every line (two at a time, to stay within ElevenLabs' limits) and join them
+    into one WAV file with a short pause between speakers. Returns the file path.
+    """
+    api_key = os.environ["ELEVENLABS_API_KEY"]
+    voices = {"play_by_play": PLAY_BY_PLAY_VOICE, "analyst": ANALYST_VOICE}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        clips = list(pool.map(lambda sl: tts_pcm(api_key, voices[sl[0]], sl[1]), lines))
+
+    pause = b"\x00\x00" * int(SAMPLE_RATE * 0.35)  # 0.35 s of silence (16-bit mono)
+    with tempfile.NamedTemporaryFile(prefix="qb_booth_", suffix=".wav", delete=False) as f:
+        path = f.name
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(SAMPLE_RATE)
+        wav.writeframes(pause.join(clips))
+    return path
+
+
+def broadcast_booth(raw_json):
+    """
+    Runs right after the analysis (so the report shows first, then the booth).
     Reads the analysis from the raw JSON box; does nothing if the analysis failed.
+    Returns (audio path, transcript HTML, note).
     """
     try:
         data = json.loads(raw_json) if raw_json else None
     except json.JSONDecodeError:
         data = None
     if not isinstance(data, dict) or "summary" not in data:
-        return None, ""
-    path, note = speak(coaching_script(data))
-    return path, (f"_{note}_" if note else "")
+        return None, "", ""
+
+    lines = booth_script(data)
+    transcript = render_booth_transcript(lines)
+    if not lines or not os.environ.get("ELEVENLABS_API_KEY"):
+        return None, transcript, ""  # No key: show the call as text only.
+    try:
+        return booth_audio(lines), transcript, ""
+    except VoiceError as e:
+        return None, transcript, f"_{e}_"
+    except Exception as e:  # Never let the voice break the page.
+        print(f"[QB Vision] Broadcast booth failed: {e!r}")
+        return None, transcript, "_The voice service had a problem. The transcript is below._"
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +788,15 @@ button.primary { font-family:'Barlow Condensed', sans-serif !important; font-wei
           margin-bottom:10px; padding-top:12px; border-top:1px solid #22314d; color:#dbe3ee; }
 .qb-small { font-size:12px; color:#8b9ab3; margin-top:4px; }
 
+/* Broadcast booth transcript */
+.qb-booth { border:1px solid #22314d; border-radius:10px; background:#0e1626; padding:6px 14px; }
+.qb-line { padding:9px 0; border-top:1px solid #1a263d; color:#e6ecf5; line-height:1.45; }
+.qb-line:first-child { border-top:none; }
+.qb-line span { display:inline-block; min-width:104px; margin-right:8px; font-family:'Barlow Condensed', sans-serif;
+                font-weight:800; font-size:14px; letter-spacing:.1em; text-transform:uppercase; }
+.qb-play_by_play span { color:#4ade80; }
+.qb-analyst span { color:#60a5fa; }
+
 /* Readable receiver/defender tables */
 .qb-table { width:100%; border-collapse:separate; border-spacing:0; border:1px solid #22314d;
             border-radius:10px; overflow:hidden; font-size:15px; }
@@ -832,12 +881,14 @@ with gr.Blocks(title="QB Vision") as demo:
         with gr.Column(scale=2):
             status_out = gr.Markdown("Upload a clip and click **Analyze play**.", elem_classes="qb-status")
             summary_out = gr.HTML()
+            section("Broadcast booth replay")
             voice_out = gr.Audio(
-                label="Coach's voice", type="filepath", autoplay=True, interactive=False,
+                label="Listen to the call", type="filepath", autoplay=True, interactive=False,
                 visible=bool(os.environ.get("ELEVENLABS_API_KEY")),  # Hidden without a key.
                 waveform_options=gr.WaveformOptions(waveform_color="#22314d",
                                                     waveform_progress_color="#22c55e"),
             )
+            booth_out = gr.HTML()
             voice_note = gr.Markdown(elem_classes="qb-status")
 
             section("Your receivers")
@@ -871,9 +922,9 @@ with gr.Blocks(title="QB Vision") as demo:
                  throw_out, timeline_out, couldnt_see_out, raw_out],
     ).then(
         # After the report is on screen, generate the spoken coaching.
-        voice_coach,
+        broadcast_booth,
         inputs=[raw_out],
-        outputs=[voice_out, voice_note],
+        outputs=[voice_out, booth_out, voice_note],
     )
 
     # Hidden, never-clicked button that satisfies ZeroGPU's startup check (see top of file).
