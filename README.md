@@ -15,7 +15,13 @@ short_description: QB smart-glasses play breakdown with Gemini
 
 Analyzes first-person football footage from smart glasses worn by a quarterback.
 Upload a clip of one play and Gemini breaks down coverage, receivers, defenders,
-where the QB's eyes went, and the throw.
+where the QB's eyes went, and the throw. Then two announcers call the play like a
+TV replay, voiced by ElevenLabs.
+
+## Try it
+
+- Working demo: https://qb-vision.onrender.com
+- Demo video: https://drive.google.com/file/d/1uBoa4ugJOWEYdlcedV-MjxxUlL_Y-Ex9/view?usp=sharing
 
 ## Run locally
 
